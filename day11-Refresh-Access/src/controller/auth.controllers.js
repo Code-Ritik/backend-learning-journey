@@ -2,7 +2,6 @@ import bcrypts from "bcryptjs";
 import userModel from "../model/user.model.js";
 import { generateToken, verifyAccessToken, verifyRefreshToken } from "../utils/auth.js";
 
-
 export const authRegisterController = async (req, res) => {
   const { name, email, password } = req.body;
 
