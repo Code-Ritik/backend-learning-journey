@@ -1,49 +1,121 @@
 import userModel from "../models/user.model.js";
 import bcrypt from "bcryptjs";
+import { createHash } from "node:crypto";
 import { generateTokens, verifyRefreshToken } from "../utils/auth.js";
+import { config } from "../config/config.js";
 
-export const authRegisterController = async (req, res) => {
-  const { name, email, password } = req.body;
+const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 
-  const isUserExist = await userModel.findOne({ email });
+const hashToken = (token) => {
+  const hashRefreshToken = createHash("sha256").update(token).digest("hex");
 
-  if (isUserExist) {
-    return res.status(400).json({
-      message: "User is already exists",
-      error: [
-        {
-          path: "email",
-          message: "user already exists",
-        },
-      ],
+  return hashRefreshToken;
+};
+
+const refreshCookieSecure = {
+  httpOnly: true,
+  sameSite: "strict",
+  secure: config.NODE_ENV === "production",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+  path: "/api/auth",
+};
+
+const normalizationEmail = (email) => email.trim().toLowerCase();
+
+const validateRegisterInput = ({ name, email, password }) => {
+  const errors = [];
+
+  if (
+    typeof name !== "string" ||
+    name.trim().length < 3 ||
+    name.trim().length > 20
+  ) {
+    errors.push({
+      path: "name",
+      message: "Name must be 3 to 20 character long",
     });
   }
 
-  const user = await userModel.create({
-    name,
-    email,
-    passwordHash: await bcrypt.hash(password, 12),
-  });
+  if (typeof email !== "string" || !emailRegex.test(email.trim())) {
+    errors.push({ path: "email", message: "Please enter a valid email" });
+  }
 
-  const { accessToken, refreshToken } = generateTokens({ userId: user._id });
+  if (typeof password !== "string" || password.trim().length < 8) {
+    errors.push({ path: "password", message: "Password should be 8 character long" });
+  }
 
-  user.refreshToken = refreshToken;
-  await user.save();
+  return errors;
+};
 
-  res.cookie("refreshToken", refreshToken, {
-    httpOnly: true,
-  });
+export const authRegisterController = async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
 
-  res.status(201).json({
-    message: "user register successfully",
-    data: {
-      user: {
-        name: user.name,
-        email: user.email,
+    const errors = validateRegisterInput({ name, email, password });
+
+    if (errors.length > 0) {
+      return res.status(400).json({
+        message: "Validation failed",
+        error: errors,
+      });
+    }
+
+    const validEmail = normalizationEmail(email);
+
+    const isUserExist = await userModel.findOne({ email: validEmail });
+
+    if (isUserExist) {
+      return res.status(400).json({
+        message: "User is already exists",
+        error: [
+          {
+            path: "email",
+            message: "user already exists",
+          },
+        ],
+      });
+    }
+
+    const user = await userModel.create({
+      name: name.trim(),
+      email: validEmail,
+      passwordHash: await bcrypt.hash(password.trim(), 12),
+    });
+
+    const { accessToken, refreshToken } = generateTokens({ userId: user._id });
+
+    user.refreshToken = hashToken(refreshToken);
+    await user.save();
+
+    res.cookie("refreshToken", refreshToken, refreshCookieSecure);
+
+    return res.status(201).json({
+      message: "user register successfully",
+      data: {
+        user: {
+          name: user.name,
+          email: user.email,
+        },
       },
-    },
-    accessToken,
-  });
+      accessToken,
+    });
+  } catch (error) {
+    if (error.name === "ValidationError") {
+      return res.status(400).json({
+        message: "Validation failed",
+        error: Object.values(error.errors).map((e) => ({
+          path: e.path,
+          message: e.message,
+        })),
+      });
+    }
+
+    console.error("Register error:", error);
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
 };
 
 export const authGetMeController = async (req, res) => {
@@ -74,13 +146,21 @@ export const authRefreshController = async (req, res) => {
 
     if (decoded.type !== "refresh") {
       return res.status(401).json({
-        message: "Unauthorized, invalid type token",
+        message: "Unauthorized, Invalid type token 1",
       });
     }
 
     const user = await userModel.findById(decoded.id);
 
-    if (refreshToken !== user.refreshToken) {
+    if (!user) {
+      return res.status(401).json({
+        message: "Unauthorized, User not found",
+      });
+    }
+
+    const cookieRefreshTokenHash = hashToken(refreshToken);
+
+    if (cookieRefreshTokenHash !== user.refreshToken) {
       user.refreshToken = null;
       await user.save();
 
@@ -93,11 +173,9 @@ export const authRefreshController = async (req, res) => {
       userId: user._id,
     });
 
-    res.cookie("refreshToken", newRefreshToken, {
-      httpOnly: true,
-    });
+    res.cookie("refreshToken", newRefreshToken, refreshCookieSecure);
 
-    user.refreshToken = newRefreshToken;
+    user.refreshToken = hashToken(newRefreshToken);
     await user.save();
 
     res.status(200).json({
@@ -112,45 +190,55 @@ export const authRefreshController = async (req, res) => {
 };
 
 export const authLoginController = async (req, res) => {
-  const { email, password } = req.body;
+  try {
+    const { email, password } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({
-      message: "Required email and password",
+    if (typeof email !== "string" || email.trim().length === 0) {
+      return res.status(400).json({
+        message: "Please provide valid credentials",
+      });
+    }
+
+    if (typeof password !== "string" || password.trim().length === 0) {
+      return res.status(400).json({
+        message: "Please provide valid credentials",
+      });
+    }
+
+    const user = await userModel.findOne({ email: normalizationEmail(email) });
+
+    if (!user) {
+      return res.status(401).json({
+        message: "Invalid credentials",
+      });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password.trim(), user.passwordHash);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        message: "Invalid Credentials",
+      });
+    }
+
+    const { accessToken, refreshToken } = generateTokens({ userId: user._id });
+
+    user.refreshToken = hashToken(refreshToken);
+    await user.save();
+
+    res.cookie("refreshToken", refreshToken, refreshCookieSecure);
+
+    res.status(200).json({
+      message: "User Logged In",
+      data: {
+        name: user.name,
+        email: user.email,
+      },
+      accessToken,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Internal Server Error",
     });
   }
-
-  const user = await userModel.findOne({ email });
-
-  if (!user) {
-    return res.status(401).json({
-      message: "Unauthorized, user not found",
-    });
-  }
-
-  const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
-
-  if (!isPasswordValid) {
-    return res.status(401).json({
-      message: "Invalid Credentials",
-    });
-  }
-
-  const { accessToken, refreshToken } = generateTokens({ userId: user._id });
-
-  user.refreshToken = refreshToken;
-  await user.save();
-
-  res.cookie("refreshToken", refreshToken, {
-    httpOnly: true,
-  });
-
-  res.status(200).json({
-    message: "User Logged In",
-    data: {
-      name: user.name,
-      email: user.email,
-    },
-    accessToken,
-  });
 };

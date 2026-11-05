@@ -6,7 +6,7 @@ const router = Router();
 
 router.post("/register", authRegisterController);
 
-router.post("/me", authMiddleware,authGetMeController);
+router.get("/me", authMiddleware,authGetMeController);
 
 router.post("/refresh", authRefreshController);
 
